@@ -1,12 +1,14 @@
-module TopoJson exposing (ArcIndex(..), Bbox, Geometry(..), Position(..), Properties, TopoJson(..), Topology, Transform, decode)
+module TopoJson exposing (ArcIndex(..), Bbox, Geometry(..), Position(..), Properties, TopoJson(..), Topology, Transform, decode, encode)
 
+import Array exposing (Array)
 import Dict exposing (Dict)
-import Json.Decode as Decode exposing (Decoder, dict, fail, field, float, int, list, maybe, string, succeed)
+import Json.Decode as Decode exposing (Decoder, array, dict, fail, field, float, int, list, maybe, string, succeed)
 import Json.Encode as Json
 
 
 
--- List are good for changes, arrays are good for lookups. Makes sense that we make these arrays by default
+-- List are good for changes, arrays are good for lookups. Makes sense that we make some of these arrays by default.
+-- Arcs for sure, but we'll hold off on the others and see what's best when we start to implement the operational portion of the library.
 
 
 type TopoJson
@@ -15,7 +17,7 @@ type TopoJson
 
 type alias Topology =
     { objects : Dict String Geometry
-    , arcs : List (List Position)
+    , arcs : Array (Array Position)
     , transform : Maybe Transform
     , bbox : Maybe Bbox
     }
@@ -54,6 +56,10 @@ type ArcIndex
     = ArcIndex Int (List Int)
 
 
+
+--- DECODER
+
+
 decode : Decoder TopoJson
 decode =
     let
@@ -73,7 +79,7 @@ decodeTopology : Decoder Topology
 decodeTopology =
     Decode.map4 Topology
         (field "objects" (dict decodeGeometry))
-        (field "arcs" (list (list decodePosition)))
+        (field "arcs" (array (array decodePosition)))
         (maybe <| field "transform" decodeTransform)
         (maybe <| field "bbox" decodeBbox)
 
@@ -193,3 +199,144 @@ decodeArcIndex =
                     fail "ArcIndex must have at least one value"
     in
     list int |> Decode.andThen helper
+
+
+
+--- ENCODER
+
+
+encode : TopoJson -> Json.Value
+encode topojson =
+    case topojson of
+        TopoJson topology ->
+            encodeTopology topology
+
+
+encodeTopology : Topology -> Json.Value
+encodeTopology topology =
+    Json.object
+        [ ( "type", Json.string "Topology" )
+        , ( "objects", Json.dict identity encodeGeometry topology.objects )
+        , ( "arcs", Json.list (\a -> Json.list encodePosition (Array.toList a)) (Array.toList topology.arcs) )
+        , ( "transform", encodeTransform topology.transform )
+        , ( "bbox", encodeBbox topology.bbox )
+        ]
+
+
+encodeGeometry : Geometry -> Json.Value
+encodeGeometry geometry =
+    case geometry of
+        Point position properties ->
+            Json.object
+                [ ( "type", Json.string "Point" )
+                , ( "coordinates", encodePosition position )
+                , ( "properties", encodeProperties properties )
+                ]
+
+        MultiPoint positions properties ->
+            Json.object
+                [ ( "type", Json.string "MultiPoint" )
+                , ( "coordinates", Json.list encodePosition positions )
+                , ( "properties", encodeProperties properties )
+                ]
+
+        LineString arcindex properties ->
+            Json.object
+                [ ( "type", Json.string "LineString" )
+                , ( "arcs", encodeArcIndex arcindex )
+                , ( "properties", encodeProperties properties )
+                ]
+
+        MultiLineString arcindecies properties ->
+            Json.object
+                [ ( "type", Json.string "MultiLineString" )
+                , ( "arcs", Json.list encodeArcIndex arcindecies )
+                , ( "properties", encodeProperties properties )
+                ]
+
+        Polygon arcindecies properties ->
+            Json.object
+                [ ( "type", Json.string "Polygon" )
+                , ( "arcs", Json.list encodeArcIndex arcindecies )
+                , ( "properties", encodeProperties properties )
+                ]
+
+        MultiPolygon arcindecies properties ->
+            Json.object
+                [ ( "type", Json.string "MultiPolygon" )
+                , ( "arcs", Json.list (Json.list encodeArcIndex) arcindecies )
+                , ( "properties", encodeProperties properties )
+                ]
+
+        GeometryCollection geometries ->
+            Json.object
+                [ ( "type", Json.string "GeometryCollection" )
+                , ( "geometries", Json.list encodeGeometry geometries )
+                ]
+
+
+encodeBbox : Maybe Bbox -> Json.Value
+encodeBbox bbox =
+    case bbox of
+        Just data ->
+            Json.object [ ( "bbox", Json.list Json.float data ) ]
+
+        Nothing ->
+            Json.null
+
+
+encodeTransform : Maybe Transform -> Json.Value
+encodeTransform transform =
+    case transform of
+        Just data ->
+            let
+                s =
+                    data.scale
+
+                t =
+                    data.translate
+
+                scale =
+                    [ Tuple.first s, Tuple.second s ]
+
+                translate =
+                    [ Tuple.first t, Tuple.second t ]
+            in
+            Json.object
+                [ ( "scale", Json.list Json.float scale )
+                , ( "translate", Json.list Json.float translate )
+                ]
+
+        Nothing ->
+            Json.null
+
+
+encodeProperties : Maybe Properties -> Json.Value
+encodeProperties properties =
+    case properties of
+        Just data ->
+            Json.dict identity Json.string data
+
+        Nothing ->
+            Json.null
+
+
+encodePosition : Position -> Json.Value
+encodePosition position =
+    case position of
+        Delta one two theRest ->
+            Json.list Json.int (one :: two :: theRest)
+
+        Coordinate one two theRest ->
+            Json.list Json.float (one :: two :: theRest)
+
+
+encodeArcIndex : ArcIndex -> Json.Value
+encodeArcIndex arcindex =
+    let
+        indicies =
+            case arcindex of
+                ArcIndex one theRest ->
+                    one :: theRest
+    in
+    Json.list Json.int indicies
