@@ -61,7 +61,7 @@ fuzzGeometry =
                     ( 1 / depth, Fuzz.map GeometryCollection (Fuzz.list (helper (depth + 1))) )
                 ]
     in
-    helper 1
+    helper 2
 
 
 fuzzTransform : Fuzzer (Maybe Transform)
