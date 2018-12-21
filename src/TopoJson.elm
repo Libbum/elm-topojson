@@ -279,7 +279,7 @@ encodeBbox : Maybe Bbox -> Json.Value
 encodeBbox bbox =
     case bbox of
         Just data ->
-            Json.object [ ( "bbox", Json.list Json.float data ) ]
+            Json.list Json.float data
 
         Nothing ->
             Json.null
