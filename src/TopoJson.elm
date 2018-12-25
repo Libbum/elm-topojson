@@ -1,4 +1,4 @@
-module TopoJson exposing (ArcIndex(..), Bbox, Geometry(..), Position(..), Properties, TopoJson(..), Topology, Transform, decode, encode)
+module TopoJson exposing (ArcIndex(..), Bbox, Geometry(..), Position(..), Properties, TopoJson(..), Topology, Transform, decode, decodeGeometry, decodeTransform, encode)
 
 import Array exposing (Array)
 import Dict exposing (Dict)
@@ -79,7 +79,7 @@ decodeTopology : Decoder Topology
 decodeTopology =
     Decode.map4 Topology
         (field "objects" (dict decodeGeometry))
-        (field "arcs" (array (array decodePosition)))
+        (field "arcs" (array (array (decodePosition True))))
         (maybe <| field "transform" decodeTransform)
         (maybe <| field "bbox" decodeBbox)
 
@@ -123,55 +123,70 @@ decodeFloatTuple =
 
 decodeGeometry : Decoder Geometry
 decodeGeometry =
+    field "transform" decodeTransform |> Decode.maybe |> Decode.andThen geometryQuantisedCheck
+
+
+geometryQuantisedCheck : Maybe Transform -> Decoder Geometry
+geometryQuantisedCheck transform =
+    let
+        quantised =
+            case transform of
+                Just _ ->
+                    True
+
+                Nothing ->
+                    False
+    in
+    field "type" string |> Decode.andThen (geometryConvert quantised)
+
+
+geometryConvert : Bool -> String -> Decoder Geometry
+geometryConvert quantised type_ =
     let
         properties =
             maybe <| field "properties" (dict string)
-
-        helper type_ =
-            case type_ of
-                "Point" ->
-                    Decode.map2 Point
-                        (field "coordinates" decodePosition)
-                        properties
-
-                "MultiPoint" ->
-                    Decode.map2 MultiPoint
-                        (field "coordinates" (list decodePosition))
-                        properties
-
-                "LineString" ->
-                    Decode.map2 LineString
-                        (field "arcs" decodeArcIndex)
-                        properties
-
-                "MultiLineString" ->
-                    Decode.map2 MultiLineString
-                        (field "arcs" (list decodeArcIndex))
-                        properties
-
-                "Polygon" ->
-                    Decode.map2 Polygon
-                        (field "arcs" (list decodeArcIndex))
-                        properties
-
-                "MultiPolygon" ->
-                    Decode.map2 MultiPolygon
-                        (field "arcs" (list (list decodeArcIndex)))
-                        properties
-
-                "GeometryCollection" ->
-                    Decode.map GeometryCollection
-                        (field "geometries" (list decodeGeometry))
-
-                _ ->
-                    fail <| "Unrecognized 'type': " ++ type_
     in
-    field "type" string
-        |> Decode.andThen helper
+    case type_ of
+        "Point" ->
+            Decode.map2 Point
+                (field "coordinates" (decodePosition quantised))
+                properties
+
+        "MultiPoint" ->
+            Decode.map2 MultiPoint
+                (field "coordinates" (list (decodePosition quantised)))
+                properties
+
+        "LineString" ->
+            Decode.map2 LineString
+                (field "arcs" decodeArcIndex)
+                properties
+
+        "MultiLineString" ->
+            Decode.map2 MultiLineString
+                (field "arcs" (list decodeArcIndex))
+                properties
+
+        "Polygon" ->
+            Decode.map2 Polygon
+                (field "arcs" (list decodeArcIndex))
+                properties
+
+        "MultiPolygon" ->
+            Decode.map2 MultiPolygon
+                (field "arcs" (list (list decodeArcIndex)))
+                properties
+
+        "GeometryCollection" ->
+            Decode.map GeometryCollection
+                (field "geometries" (list decodeGeometry))
+
+        _ ->
+            fail <| "Unrecognized 'type': " ++ type_
 
 
-decodePosition : Decoder Position
-decodePosition =
+decodePosition : Bool -> Decoder Position
+decodePosition quantised =
     let
         listToPosition type_ ps =
             case ps of
@@ -181,10 +196,12 @@ decodePosition =
                 _ ->
                     fail "Coordinate has too few values to make a position"
     in
-    Decode.oneOf
-        [ list int |> Decode.andThen (listToPosition Delta)
-        , list float |> Decode.andThen (listToPosition Coordinate)
-        ]
+    case quantised of
+        True ->
+            list int |> Decode.andThen (listToPosition Delta)
+
+        False ->
+            list float |> Decode.andThen (listToPosition Coordinate)
 
 
 decodeArcIndex : Decoder ArcIndex
@@ -214,29 +231,38 @@ encode topojson =
 
 encodeTopology : Topology -> Json.Value
 encodeTopology topology =
+    let
+        quantised =
+            case topology.transform of
+                Just _ ->
+                    True
+
+                Nothing ->
+                    False
+    in
     Json.object
         [ ( "type", Json.string "Topology" )
-        , ( "objects", Json.dict identity encodeGeometry topology.objects )
-        , ( "arcs", Json.list (\a -> Json.list encodePosition (Array.toList a)) (Array.toList topology.arcs) )
+        , ( "objects", Json.dict identity (encodeGeometry quantised) topology.objects )
+        , ( "arcs", Json.list (\a -> Json.list (encodePosition True) (Array.toList a)) (Array.toList topology.arcs) )
         , ( "transform", encodeTransform topology.transform )
         , ( "bbox", encodeBbox topology.bbox )
         ]
 
 
-encodeGeometry : Geometry -> Json.Value
-encodeGeometry geometry =
+encodeGeometry : Bool -> Geometry -> Json.Value
+encodeGeometry quantised geometry =
     case geometry of
         Point position properties ->
             Json.object
                 [ ( "type", Json.string "Point" )
-                , ( "coordinates", encodePosition position )
+                , ( "coordinates", encodePosition quantised position )
                 , ( "properties", encodeProperties properties )
                 ]
 
         MultiPoint positions properties ->
             Json.object
                 [ ( "type", Json.string "MultiPoint" )
-                , ( "coordinates", Json.list encodePosition positions )
+                , ( "coordinates", Json.list (encodePosition quantised) positions )
                 , ( "properties", encodeProperties properties )
                 ]
 
@@ -271,7 +297,7 @@ encodeGeometry geometry =
         GeometryCollection geometries ->
             Json.object
                 [ ( "type", Json.string "GeometryCollection" )
-                , ( "geometries", Json.list encodeGeometry geometries )
+                , ( "geometries", Json.list (encodeGeometry quantised) geometries )
                 ]
 
 
@@ -321,14 +347,25 @@ encodeProperties properties =
             Json.null
 
 
-encodePosition : Position -> Json.Value
-encodePosition position =
-    case position of
-        Delta one two theRest ->
-            Json.list Json.int (one :: two :: theRest)
+encodePosition : Bool -> Position -> Json.Value
+encodePosition quantised position =
+    case quantised of
+        True ->
+            case position of
+                Delta one two theRest ->
+                    Json.list Json.int (one :: two :: theRest)
 
-        Coordinate one two theRest ->
-            Json.list Json.float (one :: two :: theRest)
+                --TODO: This is not handled correctly
+                Coordinate _ _ _ ->
+                    Json.null
+
+        False ->
+            case position of
+                Delta one two theRest ->
+                    Json.list Json.int (one :: two :: theRest)
+
+                Coordinate one two theRest ->
+                    Json.list Json.float (one :: two :: theRest)
 
 
 encodeArcIndex : ArcIndex -> Json.Value
