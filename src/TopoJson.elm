@@ -1,9 +1,10 @@
-module TopoJson exposing (ArcIndex(..), Bbox, Geometry(..), Position(..), Properties, TopoJson(..), Topology, Transform, decode, decodeGeometry, decodeTransform, encode)
+module TopoJson exposing (ArcIndex(..), Bbox, Geometry(..), Position(..), Properties, TopoJson(..), Topology, Transform, arcTransform, bbBounds, bbGeometry, bbox, bboxPoint, decode, encode, transform)
 
 import Array exposing (Array)
 import Dict exposing (Dict)
 import Json.Decode as Decode exposing (Decoder, array, dict, fail, field, float, int, list, maybe, string, succeed)
 import Json.Encode as Json
+import Maybe.Extra as Maybe
 
 
 
@@ -19,7 +20,7 @@ type alias Topology =
     { objects : Dict String Geometry
     , arcs : Array (Array Position)
     , transform : Maybe Transform
-    , bbox : Maybe Bbox
+    , boundingbox : Maybe Bbox
     }
 
 
@@ -77,10 +78,14 @@ decode =
 
 decodeTopology : Decoder Topology
 decodeTopology =
+    let
+        trans =
+            maybe <| field "transform" decodeTransform
+    in
     Decode.map4 Topology
-        (field "objects" (dict decodeGeometry))
+        (trans |> Decode.andThen (\t -> field "objects" (dict (decodeGeometry t))))
         (field "arcs" (array (array (decodePosition True))))
-        (maybe <| field "transform" decodeTransform)
+        trans
         (maybe <| field "bbox" decodeBbox)
 
 
@@ -121,22 +126,22 @@ decodeFloatTuple =
     list float |> Decode.andThen listToTuple
 
 
-decodeGeometry : Decoder Geometry
-decodeGeometry =
-    field "transform" decodeTransform |> Decode.maybe |> Decode.andThen geometryQuantisedCheck
-
-
-geometryQuantisedCheck : Maybe Transform -> Decoder Geometry
-geometryQuantisedCheck transform =
+decodeGeometry : Maybe Transform -> Decoder Geometry
+decodeGeometry trans =
     let
         quantised =
-            case transform of
+            case trans of
                 Just _ ->
                     True
 
                 Nothing ->
                     False
     in
+    field "type" string |> Decode.andThen (geometryConvert quantised)
+
+
+collectionConvert : Bool -> Decoder Geometry
+collectionConvert quantised =
     field "type" string |> Decode.andThen (geometryConvert quantised)
 
 
@@ -179,7 +184,7 @@ geometryConvert quantised type_ =
 
         "GeometryCollection" ->
             Decode.map GeometryCollection
-                (field "geometries" (list decodeGeometry))
+                (field "geometries" (list (collectionConvert quantised)))
 
         _ ->
             fail <| "Unrecognized 'type': " ++ type_
@@ -245,7 +250,7 @@ encodeTopology topology =
         , ( "objects", Json.dict identity (encodeGeometry quantised) topology.objects )
         , ( "arcs", Json.list (\a -> Json.list (encodePosition True) (Array.toList a)) (Array.toList topology.arcs) )
         , ( "transform", encodeTransform topology.transform )
-        , ( "bbox", encodeBbox topology.bbox )
+        , ( "bbox", encodeBbox topology.boundingbox )
         ]
 
 
@@ -302,8 +307,8 @@ encodeGeometry quantised geometry =
 
 
 encodeBbox : Maybe Bbox -> Json.Value
-encodeBbox bbox =
-    case bbox of
+encodeBbox box =
+    case box of
         Just data ->
             Json.list Json.float data
 
@@ -312,8 +317,8 @@ encodeBbox bbox =
 
 
 encodeTransform : Maybe Transform -> Json.Value
-encodeTransform transform =
-    case transform of
+encodeTransform trans =
+    case trans of
         Just data ->
             let
                 s =
@@ -377,3 +382,146 @@ encodeArcIndex arcindex =
                     one :: theRest
     in
     Json.list Json.int indicies
+
+
+
+--- CLIENT
+--- TRANSFORMS
+
+
+transform : Maybe Transform -> Position -> Position
+transform trans current =
+    case ( trans, current ) of
+        ( Just t, Delta one two theRest ) ->
+            let
+                kx =
+                    Tuple.first t.scale
+
+                ky =
+                    Tuple.second t.scale
+
+                dx =
+                    Tuple.first t.translate
+
+                dy =
+                    Tuple.second t.translate
+            in
+            Coordinate (toFloat one * kx + dx) (toFloat two * ky + dy) (List.map toFloat theRest)
+
+        ( Nothing, Delta one two theRest ) ->
+            Coordinate (toFloat one) (toFloat two) (List.map toFloat theRest)
+
+        _ ->
+            current
+
+
+bbox : Topology -> Maybe { xmin : Float, xmax : Float, ymin : Float, ymax : Float }
+bbox topology =
+    let
+        objectBounds =
+            topology.objects
+                |> Dict.values
+                |> List.map (bbGeometry topology.transform)
+                |> List.concat
+                |> Maybe.values
+                |> List.unzip
+                |> bbBounds
+
+        arcs =
+            topology.arcs
+                |> Array.map Array.toList
+                |> Array.toList
+
+        _ =
+            Debug.log "arcs" arcs
+    in
+    objectBounds
+
+
+arcTransform : Maybe Transform -> Maybe { xmin : Float, xmax : Float, ymin : Float, ymax : Float } -> List Position -> Float
+arcTransform trans bounds arc =
+    case ( trans, bounds ) of
+        ( Just t, Just b ) ->
+            let
+                kx =
+                    Tuple.first t.scale
+
+                ky =
+                    Tuple.second t.scale
+
+                dx =
+                    Tuple.first t.translate
+
+                dy =
+                    Tuple.second t.translate
+            in
+            List.foldl
+                (\pos x0 ->
+                    case pos of
+                        Delta one _ _ ->
+                            let
+                                new =
+                                    (toFloat one + x0) * kx + dx
+
+                                _ =
+                                    Debug.log "new" new
+
+                                _ =
+                                    Debug.log "x0" x0
+                            in
+                            if new < x0 then
+                                new
+
+                            else
+                                x0
+
+                        _ ->
+                            x0
+                )
+                b.xmin
+                arc
+
+        _ ->
+            0.0
+
+
+bbGeometry : Maybe Transform -> Geometry -> List (Maybe ( Float, Float ))
+bbGeometry trans object =
+    case object of
+        Point position _ ->
+            [ bboxPoint <| transform trans position ]
+
+        MultiPoint positions _ ->
+            List.map (\position -> bboxPoint <| transform trans position) positions
+
+        GeometryCollection geometries ->
+            List.map (bbGeometry trans) geometries
+                |> List.concat
+
+        _ ->
+            []
+
+
+bboxPoint : Position -> Maybe ( Float, Float )
+bboxPoint position =
+    case position of
+        Coordinate one two _ ->
+            Just ( one, two )
+
+        _ ->
+            Nothing
+
+
+bbBounds : ( List Float, List Float ) -> Maybe { xmin : Float, xmax : Float, ymin : Float, ymax : Float }
+bbBounds ( xvals, yvals ) =
+    let
+        bounds =
+            [ List.minimum xvals, List.maximum xvals, List.minimum yvals, List.maximum yvals ]
+                |> Maybe.values
+    in
+    case bounds of
+        [ xmin, xmax, ymin, ymax ] ->
+            Just { xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax }
+
+        _ ->
+            Nothing
